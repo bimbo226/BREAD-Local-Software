@@ -131,6 +131,12 @@ int bio_post_heaters[2][4] = {    // bioreactor post processing heaters {address
 float bio_post_heater_pid[2][4];  // {setpoint, Kp, Ki, Kd}
 float bio_thermo_val[4] = {0,0,0,0};
 
+uint8_t auto = 0;
+uint8_t checkOsc = 0;
+uint8_t peak = 0;
+hw_timer_t *timer = NULL;
+float bio_post_heater_auto[5] = {0,0,0,0,0}; // {maxTemp, prevTemp, prevTime, Peak1, prevDeriv}
+
 int bio_ph[2][2] = {      // bioreactor pH layout {PHDO address, DCMT address}
   {98, 20},
   {100, 21}
@@ -404,6 +410,14 @@ Chem Decon Commands:
       }else if(postName.charAt(0) == 'P') {   // bioreactor post processing
         uint8_t index = postName.substring(2).toInt() - 1;
         switch(postName.charAt(1)) {
+          //new case for autotune 3-6-2024
+          case 'a':
+            auto = 1;
+            //Send initial Kp value
+            bio_post_heater_pid[index][1] = postValue.toFloat();
+            timer = timerBegin(60);
+            RLHTCommandPID(bio_post_heaters[index][0], bio_post_heaters[index][1], bio_post_heater_pid[index][1], 0, 0);
+            break;
           case 's': //setpoint
             bio_post_heater_pid[index][0] = postValue.toFloat();
             RLHTCommandSetpoint(bio_post_heaters[index][0], bio_post_heaters[index][1], bio_post_heater_pid[index][0], bio_post_heaters[index][2], bio_post_heaters[index][3]);
@@ -598,10 +612,27 @@ void loop() {
     }
     for(int i=0;i<2;i++){
       float temp;
+      //if thermocouple 1?
       if(bio_post_heaters[i][2] == 1)
+      {
         RLHTRequestThermo(bio_post_heaters[i][0], &(bio_thermo_val[i+2]), &(temp));
+        
+      } 
       if(bio_post_heaters[i][2] == 2)
+      {
         RLHTRequestThermo(bio_post_heaters[i][0], &(temp), &(bio_thermo_val[i+2]));
+        //(int address, byte heater, float Ku,float setpoint, float temp, float time)
+        
+        RLHTCommandPIDAuto(bio_post_heaters[i][0], bio_post_heaters[i][1],bio_post_heater_pid[i][1],bio_post_heater_pid[i][0],bio_thermo_val[4],timerReadSeconds(timer));
+        //if not oscillating...
+        if (checkOsc == 0)
+        {
+          timerRestart(timer);
+        }
+        
+        //RLHTCommandSetpoint(bio_post_heaters[index][0], bio_post_heaters[index][1], bio_post_heater_pid[index][0], bio_post_heaters[index][2], bio_post_heaters[index][3]);
+      }
+       
     }
     readRequestedPHDO = false;  // reload new read request
     
@@ -713,6 +744,86 @@ void RLHTCommandSetpoint(int address, byte heater, float heatSetpoint, byte ther
   Serial.print(thermocouple);
   Serial.println(enableReverse);
 }
+/*
+* Automatically tunes heater gains (Ki, Kd, Kp)
+* 
+* int address - address of heater slice
+* byte heater - 
+* float Ku - ultimate gain
+* float setpoint
+*/
+void RLHTCommandPIDAuto(int address, byte heater, float Ku,float setpoint, float temp, double time)
+{
+
+
+//we could just increase the gain super slowly
+  if (auto == 1)
+  {
+    //((current T - previous T) / (current time - previous timee))
+    double driv = (temp - bio_post_heater_auto[1])/(time - bio_post_heater_auto[2]);
+    //if T is less than 2% of Setpoint and the derivative is decreasing and it isn't oscillating...
+    if ((temp < setpoint - (setpoint * 0.02)) && driv - bio_post_heater_auto[4] < 0 && checkOsc == 0)
+    {
+        //double Ku and send new gains
+        Ku = Ku * 2;
+        RLHTCommandPID(address, heater, Ku, 0, 0);
+      
+    }
+    else
+    {
+      //check for oscillations
+      checkOsc = 1;
+      //If MaxTemp is less than current temp, set new peak 1 max and continue
+      if(bio_post_heater_auto[0] < temp)
+      {
+        bio_post_heater_auto[0] = temp;
+      }
+      //If previous T is smaller than current, set new maximum T
+      else if(bio_post_heater_auto[1] < temp){
+        //increasing to peak 2
+        bio_post_heater_auto[0] = temp;
+      }
+      //If max observed T is larger than new and we have not found the first peak, set it as the first peak
+      if(bio_post_heater_auto[0] > temp && peak == 0){
+        bio_post_heater_auto[3] = bio_post_heater_auto[0];
+        peak = 1;
+        timerRestart(timer);
+      }
+      //If max observed T is larger than new and we have found the first peak...
+      else if (bio_post_heater_auto[0] > temp && peak == 1){
+        //Find the delta between the secondpeak-firstpeak
+        float delp = bio_post_heater_auto[0]-bio_post_heater_auto[3];
+        //If the delta is greater than 0, change Ku
+        if(delp > 0){
+          Ku = (Ku / 1.5); //or Ku - (Ku/2)
+        }
+        else{
+          float time = timerReadSeconds(timer)
+          RLHTCommandPID(address, heater, 0.6*Ku, (1.2*Ku)/time, 0.075*Ku*time);
+          checkOsc = 0;
+          auto = 0;
+          timerStop(timer);
+        }
+      }
+    }
+    //saving old time, temp, and dericative
+    bio_post_heater_auto[1] = temp;
+    bio_post_heater_auto[2] = time;
+    bio_post_heater_auto[4] = driv;
+  }
+  
+  //If auto = 1
+  //  get change in temp 
+  //  get change in time
+  //  If change in temp is close to _, double Ku and send to RLHT
+  //  If temp is within setpoint, monitor for oscillations
+  //    Record time between oscillations 
+  //    If oscillations are increasing, decrease Ku slightly
+  //    If oscillations are decreasing, increase Ku slightly
+  //  If stable perform Kp, Ki, and Kd calculations and send to RLHT
+  // set auto = 0
+
+}
 
 void RLHTCommandPID(int address, byte heater, float Kp_set, float Ki_set, float Kd_set)
 {
@@ -820,6 +931,7 @@ void DCMTCommandPH(int address, float pHSetpoint_set, float currentPH_set)
 
 void DCMTCommandPHPID(int address, float Kp_set, float Ki_set, float Kd_set)
 {
+  //autotune code here
   FLOATUNION_t Kp, Ki, Kd;
   Kp.number = Kp_set;
   Ki.number = Ki_set;
