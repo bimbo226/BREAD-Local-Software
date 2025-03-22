@@ -131,7 +131,7 @@ int bio_post_heaters[2][4] = {    // bioreactor post processing heaters {address
 float bio_post_heater_pid[2][4];  // {setpoint, Kp, Ki, Kd}
 float bio_thermo_val[4] = {0,0,0,0};
 
-uint8_t auto = 0;
+uint8_t autoCheck = 0;
 uint8_t checkOsc = 0;
 uint8_t peak = 0;
 hw_timer_t *timer = NULL;
@@ -412,10 +412,10 @@ Chem Decon Commands:
         switch(postName.charAt(1)) {
           //new case for autotune 3-6-2024
           case 'a':
-            auto = 1;
+            autoCheck = 1;
             //Send initial Kp value
             bio_post_heater_pid[index][1] = postValue.toFloat();
-            timer = timerBegin(60);
+            timer = timerBegin(0, 80, true);
             RLHTCommandPID(bio_post_heaters[index][0], bio_post_heaters[index][1], bio_post_heater_pid[index][1], 0, 0);
             break;
           case 's': //setpoint
@@ -757,7 +757,7 @@ void RLHTCommandPIDAuto(int address, byte heater, float Ku,float setpoint, float
 
 
 //we could just increase the gain super slowly
-  if (auto == 1)
+  if (autoCheck == 1)
   {
     //((current T - previous T) / (current time - previous timee))
     double driv = (temp - bio_post_heater_auto[1])/(time - bio_post_heater_auto[2]);
@@ -801,7 +801,7 @@ void RLHTCommandPIDAuto(int address, byte heater, float Ku,float setpoint, float
           float time = timerReadSeconds(timer)
           RLHTCommandPID(address, heater, 0.6*Ku, (1.2*Ku)/time, 0.075*Ku*time);
           checkOsc = 0;
-          auto = 0;
+          autoCheck = 0;
           timerStop(timer);
         }
       }
